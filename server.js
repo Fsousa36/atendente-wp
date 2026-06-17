@@ -10,24 +10,16 @@ app.use(express.json());
 
 const { Pool } = pg;
 
-// 1. CONEXÃO COM O SEU POSTGRESQL (Puxa a URL configurada no seu arquivo .env)
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) {
-    console.error("❌ Erro: A variável DATABASE_URL não foi encontrada no arquivo .env");
-    process.exit(1);
-}
-
+// Configuração robusta com SSL Bypass para aceitar a rede interna do Coolify
 const pool = new Pool({ 
-    connectionString: DATABASE_URL,
+    connectionString: process.env.DATABASE_URL,
     ssl: {
-        rejectUnauthorized: false // Permite a conexão segura com o banco remoto
+        rejectUnauthorized: false
     }
 });
 
-// 2. CONEXÃO COM A API DO GEMINI
-const ai = new GoogleGenAI({}); // Puxa automaticamente a GEMINI_API_KEY do seu .env
+const ai = new GoogleGenAI({}); 
 
-// 3. AUTO-MIGRATE: Cria as tabelas do seu SaaS caso elas ainda não existam no banco
 async function inicializarTabelas() {
     const queryTabelas = `
         CREATE TABLE IF NOT EXISTS empresas (
@@ -48,7 +40,7 @@ async function inicializarTabelas() {
             id SERIAL PRIMARY KEY,
             empresa_id INT REFERENCES empresas(id) ON DELETE CASCADE,
             cliente_whatsapp VARCHAR(50) NOT NULL,
-            role VARCHAR(20) NOT NULL, -- 'user' ou 'model'
+            role VARCHAR(20) NOT NULL,
             content TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -57,81 +49,106 @@ async function inicializarTabelas() {
         await pool.query(queryTabelas);
         console.log("⚡ Tabelas do PostgreSQL checadas e prontas para uso!");
     } catch (err) {
-        console.error("❌ Erro ao inicializar tabelas no Postgres:", err);
+        console.error("❌ Erro ao criar tabelas no Postgres:", err);
     }
 }
 inicializarTabelas();
 
-// 4. WEBHOOK PRINCIPAL: Rota que vai receber as mensagens do WhatsApp
+// ROTA EXCLUSIVA PARA POPULAR O BANCO DE DADOS PELO NAVEGADOR
+app.get('/adicionar-dados-teste', async (req, res) => {
+    try {
+        // Verifica se a empresa já existe para não duplicar
+        const checarEmpresa = await pool.query("SELECT id FROM empresas WHERE id = 1");
+        if (checarEmpresa.rows.length > 0) {
+            return res.status(200).send("🚀 O banco já estava populado! Empresa ID 1 pronta.");
+        }
+
+        // 1. Cria a primeira empresa (TecnoCert)
+        await pool.query(`
+            INSERT INTO empresas (id, nome_empresa, prompt_personalidade)
+            VALUES (
+                1,
+                'TecnoCert Certificados Digitais',
+                'Você é o Carlos, atendente virtual focado em vendas da TecnoCert. Seu objetivo é passar orçamentos de forma educada, humana e usar quebras de linha frequentes.'
+            );
+        `);
+
+        // 2. Cadastra os produtos atrelados a ela
+        await pool.query(`
+            INSERT INTO produtos (empresa_id, nome, preco, descricao)
+            VALUES 
+            (1, 'Certificado Digital A1 em Nuvem', 149.90, 'Validade de 1 ano, ideal para computadores e celulares. Emissão 100% online por videoconferência.'),
+            (1, 'Certificado Digital A3 Cartão/Token', 299.00, 'Validade de 3 anos. Mídia física inclusa.'),
+            (1, 'Renovação Simplificada', 120.00, 'Para quem já é cliente e quer renovar o modelo A1 sem videoconferência.');
+        `);
+
+        return res.status(200).send("🚀 Banco populado com sucesso de dentro da VPS! Empresa ID: 1");
+    } catch (error) {
+        console.error(error);
+        return res.status(500).send("❌ Erro ao popular banco: " + error.message);
+    }
+});
+
+// Webhook do WhatsApp
 app.post('/webhook/whatsapp', async (req, res) => {
-    const { from, body, companyId } = req.body; // Número do cliente, o texto da mensagem e o ID da empresa
+    const { from, body, companyId } = req.body;
 
     if (!from || !body || !companyId) {
-        return res.status(400).json({ error: "Dados incompletos no webhook. Envie 'from', 'body' e 'companyId'." });
+        return res.status(400).json({ error: "Dados incompletos no webhook." });
     }
 
     try {
-        // A. Grava a mensagem atual que o cliente enviou no histórico do Postgres
         await pool.query(
             'INSERT INTO historico_conversas (empresa_id, cliente_whatsapp, role, content) VALUES ($1, $2, $3, $4)',
             [companyId, from, 'user', body]
         );
 
-        // B. Busca as configurações de personalidade da empresa
         const empresaRes = await pool.query('SELECT * FROM empresas WHERE id = $1', [companyId]);
         if (empresaRes.rows.length === 0) {
             return res.status(404).json({ error: "Empresa não cadastrada no sistema." });
         }
         const empresa = empresaRes.rows[0];
 
-        // C. Busca a tabela de produtos/preços cadastrados para essa empresa
         const produtosRes = await pool.query('SELECT * FROM produtos WHERE empresa_id = $1', [companyId]);
         const tabelaProdutosTexto = produtosRes.rows.map(p => 
-            `- ${p.nome}: R$ ${p.preco} (${p.descricao || 'Sem descrição'})`
+            `- ${p.nome}: R$ ${p.preco} (${p.descricao || ''})`
         ).join('\n');
 
-        // D. Busca a memória (as últimas 10 mensagens dessa conversa para o Gemini contextualizar)
         const historicoRes = await pool.query(
             'SELECT role, content FROM historico_conversas WHERE cliente_whatsapp = $1 AND empresa_id = $2 ORDER BY created_at DESC LIMIT 10',
             [from, companyId]
         );
         
-        // Inverte o histórico para que fique na ordem cronológica correta (da mais antiga para a mais recente)
         const chatContents = historicoRes.rows.reverse().map(msg => ({
-            role: msg.role, // 'user' ou 'model'
+            role: msg.role,
             parts: [{ text: msg.content }]
         }));
 
-        // E. Estrutura a grande instrução mestre do atendente autônomo
-        const systemInstruction = `${empresa.prompt_personalidade}\n\nTABELA DE PRODUTOS E PREÇOS ATUAIS DA EMPRESA:\n${tabelaProdutosTexto}\n\nREGRAS DE CONVENÇÃO:\n- Nunca invente produtos, serviços ou preços que não estão listados acima.\n- Responda de forma curta, objetiva e use quebras de linha frequentes para parecer digitação humana no WhatsApp.\n- Seu foco principal é tirar dúvidas e fechar o orçamento de forma natural.`;
+        const systemInstruction = `${empresa.prompt_personalidade}\n\nTABELA DE PRODUTOS E PREÇOS:\n${tabelaProdutosTexto}\n\nREGRAS:\n- Nunca invente preços ou produtos.\n- Use quebras de linha e seja muito natural.\n- Foque em fechar o orçamento de forma humana.`;
 
-        // F. Envia o histórico e as regras para o Gemini 1.5 Flash processar
         const response = await ai.models.generateContent({
             model: 'gemini-1.5-flash',
             contents: chatContents,
             config: {
                 systemInstruction: systemInstruction,
-                temperature: 0.7, // Fator humano: varia as respostas sem perder o foco das regras
+                temperature: 0.7,
             }
         });
 
         const respostaIA = response.text;
 
-        // G. Salva a resposta gerada pela IA no banco para servir de memória na próxima interação
         await pool.query(
             'INSERT INTO historico_conversas (empresa_id, cliente_whatsapp, role, content) VALUES ($1, $2, $3, $4)',
             [companyId, from, 'model', respostaIA]
         );
 
-        // H. Resposta de sucesso do Webhook (Aqui no futuro você disparará para a API do seu Gateway de WhatsApp)
         return res.status(200).json({ success: true, reply: respostaIA });
 
     } catch (error) {
-        console.error("❌ Erro interno ao processar mensagem do agente:", error);
-        return res.status(500).json({ error: "Erro interno no servidor ao gerar atendimento." });
+        console.error("Erro interno no agente:", error);
+        return res.status(500).json({ error: "Erro ao processar mensagem do agente." });
     }
 });
 
-// Inicializa o servidor na porta configurada
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Servidor de Atendimento Ativo na porta ${PORT}`));
