@@ -10,16 +10,17 @@ app.use(express.json());
 
 const { Pool } = pg;
 
-// Configuração robusta com SSL Bypass para aceitar a rede interna do Coolify
+// Configuração robusta com injeção de SSL para aceitar a rede interna do Coolify
 const pool = new Pool({ 
     connectionString: process.env.DATABASE_URL,
     ssl: {
-        rejectUnauthorized: false
+        rejectUnauthorized: false // Ignora a validação estrita de certificados autoassinados da VPS
     }
 });
 
 const ai = new GoogleGenAI({}); 
 
+// Função que cria as tabelas automaticamente se elas não existirem
 async function inicializarTabelas() {
     const queryTabelas = `
         CREATE TABLE IF NOT EXISTS empresas (
@@ -54,13 +55,13 @@ async function inicializarTabelas() {
 }
 inicializarTabelas();
 
-// ROTA EXCLUSIVA PARA POPULAR O BANCO DE DADOS PELO NAVEGADOR
+// ROTA EXCLUSIVA PARA POPULAR O BANCO DE DADOS DIRETO PELO NAVEGADOR
 app.get('/adicionar-dados-teste', async (req, res) => {
     try {
-        // Verifica se a empresa já existe para não duplicar
+        // Verifica se a empresa teste (ID 1) já existe para evitar duplicações
         const checarEmpresa = await pool.query("SELECT id FROM empresas WHERE id = 1");
         if (checarEmpresa.rows.length > 0) {
-            return res.status(200).send("🚀 O banco já estava populado! Empresa ID 1 pronta.");
+            return res.status(200).send("🚀 O banco já estava populado! Empresa ID 1 pronta para uso.");
         }
 
         // 1. Cria a primeira empresa (TecnoCert)
@@ -79,76 +80,4 @@ app.get('/adicionar-dados-teste', async (req, res) => {
             VALUES 
             (1, 'Certificado Digital A1 em Nuvem', 149.90, 'Validade de 1 ano, ideal para computadores e celulares. Emissão 100% online por videoconferência.'),
             (1, 'Certificado Digital A3 Cartão/Token', 299.00, 'Validade de 3 anos. Mídia física inclusa.'),
-            (1, 'Renovação Simplificada', 120.00, 'Para quem já é cliente e quer renovar o modelo A1 sem videoconferência.');
-        `);
-
-        return res.status(200).send("🚀 Banco populado com sucesso de dentro da VPS! Empresa ID: 1");
-    } catch (error) {
-        console.error(error);
-        return res.status(500).send("❌ Erro ao popular banco: " + error.message);
-    }
-});
-
-// Webhook do WhatsApp
-app.post('/webhook/whatsapp', async (req, res) => {
-    const { from, body, companyId } = req.body;
-
-    if (!from || !body || !companyId) {
-        return res.status(400).json({ error: "Dados incompletos no webhook." });
-    }
-
-    try {
-        await pool.query(
-            'INSERT INTO historico_conversas (empresa_id, cliente_whatsapp, role, content) VALUES ($1, $2, $3, $4)',
-            [companyId, from, 'user', body]
-        );
-
-        const empresaRes = await pool.query('SELECT * FROM empresas WHERE id = $1', [companyId]);
-        if (empresaRes.rows.length === 0) {
-            return res.status(404).json({ error: "Empresa não cadastrada no sistema." });
-        }
-        const empresa = empresaRes.rows[0];
-
-        const produtosRes = await pool.query('SELECT * FROM produtos WHERE empresa_id = $1', [companyId]);
-        const tabelaProdutosTexto = produtosRes.rows.map(p => 
-            `- ${p.nome}: R$ ${p.preco} (${p.descricao || ''})`
-        ).join('\n');
-
-        const historicoRes = await pool.query(
-            'SELECT role, content FROM historico_conversas WHERE cliente_whatsapp = $1 AND empresa_id = $2 ORDER BY created_at DESC LIMIT 10',
-            [from, companyId]
-        );
-        
-        const chatContents = historicoRes.rows.reverse().map(msg => ({
-            role: msg.role,
-            parts: [{ text: msg.content }]
-        }));
-
-        const systemInstruction = `${empresa.prompt_personalidade}\n\nTABELA DE PRODUTOS E PREÇOS:\n${tabelaProdutosTexto}\n\nREGRAS:\n- Nunca invente preços ou produtos.\n- Use quebras de linha e seja muito natural.\n- Foque em fechar o orçamento de forma humana.`;
-
-        const response = await ai.models.generateContent({
-            model: 'gemini-1.5-flash',
-            contents: chatContents,
-            config: {
-                systemInstruction: systemInstruction,
-                temperature: 0.7,
-            }
-        });
-
-        const respostaIA = response.text;
-
-        await pool.query(
-            'INSERT INTO historico_conversas (empresa_id, cliente_whatsapp, role, content) VALUES ($1, $2, $3, $4)',
-            [companyId, from, 'model', respostaIA]
-        );
-
-        return res.status(200).json({ success: true, reply: respostaIA });
-
-    } catch (error) {
-        console.error("Erro interno no agente:", error);
-        return res.status(500).json({ error: "Erro ao processar mensagem do agente." });
-    }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor de Atendimento Ativo na porta ${PORT}`));
+            (1, 'Renovação Simplificada', 120.00, 'Para
